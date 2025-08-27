@@ -1,0 +1,22 @@
+on: [pull_request]
+jobs:
+  css-impact-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract changed selectors
+        run: |
+          git fetch origin main
+          git diff origin/main...HEAD -- '*.css' \
+            | grep -oE '(\.[a-zA-Z0-9_-]+|#[a-zA-Z0-9_-]+)' \
+            | sort -u > selectors.txt
+
+      - name: Search usage
+        run: |
+          while read sel; do
+            token="${sel#.}" # remove prefix . or #
+            if ! rg -q "$token" src/; then
+              echo "⚠️ Possibly unused selector: $sel"
+            fi
+          done < selectors.txt
