@@ -4,16 +4,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+      - name: Setup GitHub CLI authentication
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
 
       - name: Check CSS impact and comment
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
-          cat << 'EOF' > check_css.sh
-          #!/bin/bash
+          # ベースブランチを特定
+          base_branch="${GITHUB_BASE_REF:-master}"
+          echo "Base branch: $base_branch"
 
-          git fetch origin main
+          # リモートブランチの情報を取得
+          git fetch origin $base_branch
 
           # CSSファイルの変更からセレクターを抽出
-          selectors=$(git diff origin/main...HEAD -- '*.css' | grep -oE '(\.[a-zA-Z][a-zA-Z0-9_-]*|#[a-zA-Z][a-zA-Z0-9_-]*)' | sort -u)
+          selectors=$(git diff origin/$base_branch -- '*.css' | grep -oE '(\.[a-zA-Z][a-zA-Z0-9_-]*|#[a-zA-Z][a-zA-Z0-9_-]*)' | grep -v '^\.css$' | sort -u)
+
+          echo "Found selectors: $selectors"
 
           if [ -z "$selectors" ]; then
             echo "No CSS selectors found in changes"
@@ -23,14 +46,18 @@ jobs:
           # 変更されたセレクターが他のファイルで使用されているかをチェック
           impacted_files=""
           while IFS= read -r selector; do
+            echo "Checking selector: $selector"
             if [[ "$selector" =~ ^\. ]]; then
               # クラス名の場合
               class_name="${selector#.}"
-              files=$(rg -l --word-regexp "$class_name" src/ 2>/dev/null || true)
+              # HTMLファイル内でクラス名を検索
+              files=$(grep -l "class=[\"'].*$class_name.*[\"']" src/*.html 2>/dev/null || true)
+              echo "Class '$class_name' found in files: $files"
             elif [[ "$selector" =~ ^# ]]; then
               # ID名の場合
               id_name="${selector#}"
-              files=$(rg -l "id=[\"']$id_name[\"']" src/ 2>/dev/null || true)
+              files=$(grep -l "id=[\"']$id_name[\"']" src/*.html 2>/dev/null || true)
+              echo "ID '$id_name' found in files: $files"
             fi
 
             if [ -n "$files" ]; then
@@ -38,19 +65,60 @@ jobs:
             fi
           done <<< "$selectors"
 
-          # 影響を受けるファイルがある場合はコメント
+          # 影響を受けるファイルがある場合はPRにコメント
           if [ -n "$impacted_files" ]; then
-            cat << 'COMMENT_EOF' | gh pr comment --body-file -
-          ⚠️ **CSS Impact Check Warning**
+            echo "Files impacted by CSS changes: $impacted_files"
 
-          以下のCSSセレクターが変更されており、以下のファイルに影響を与える可能性があります：$impacted_files
+            # GitHub CLIの認証状況を確認
+            echo "Checking GitHub CLI authentication..."
+            if ! gh auth status >/dev/null 2>&1; then
+              echo "GitHub CLI not authenticated. Skipping PR comment."
+              exit 0
+            fi
 
-          これらのファイルの動作に影響がないか確認してください。
-          COMMENT_EOF
+            # PRの情報を確認
+            echo "PR information:"
+            echo "  Base ref: $GITHUB_BASE_REF"
+            echo "  Head ref: $GITHUB_HEAD_REF"
+            echo "  Repository: $GITHUB_REPOSITORY"
+            echo "  Event path: $GITHUB_EVENT_PATH"
+            echo "  GITHUB_REF: $GITHUB_REF"
+
+            # 現在のディレクトリとGitの状況を確認
+            echo "Current directory: $(pwd)"
+            echo "Git remote: $(git remote -v)"
+            echo "Git status: $(git status --porcelain)"
+
+            # 利用可能なPRを確認
+            echo "Available PRs:"
+            gh pr list --limit 5 || echo "Failed to list PRs"
+
+            # GITHUB_REFからPR番号を取得
+            pr_number=$(echo "$GITHUB_REF" | sed 's|refs/pull/\([0-9]*\)/merge|\1|')
+            echo "PR number from GITHUB_REF: $pr_number"
+
+            # コメントファイルを作成
+            echo "⚠️ **CSS Impact Check Warning**" > /tmp/comment.md
+            echo "" >> /tmp/comment.md
+            echo "以下のCSSセレクターが変更されており、以下のファイルに影響を与える可能性があります：$impacted_files" >> /tmp/comment.md
+            echo "" >> /tmp/comment.md
+            echo "これらのファイルの動作に影響がないか確認してください。" >> /tmp/comment.md
+
+            # PRにコメントを投稿（PR番号を明示的に指定）
+            echo "Attempting to post PR comment to PR #$pr_number..."
+            if [ -n "$pr_number" ] && [ "$pr_number" != "$GITHUB_REF" ]; then
+              if gh pr comment $pr_number --body-file /tmp/comment.md; then
+                echo "PR comment posted successfully to PR #$pr_number"
+              else
+                echo "Failed to post PR comment to PR #$pr_number"
+                echo "Please check the following files manually:"
+                echo "$impacted_files"
+              fi
+            else
+              echo "Could not determine PR number from GITHUB_REF: $GITHUB_REF"
+              echo "Please check the following files manually:"
+              echo "$impacted_files"
+            fi
           else
             echo "No files are impacted by CSS changes"
           fi
-          EOF
-
-          chmod +x check_css.sh
-          ./check_css.sh
