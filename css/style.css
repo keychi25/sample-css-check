@@ -12,3 +12,8 @@ h1 {
 p {
   margin: 0 0 1em;
 }
+
+.h1-main {
+	font-size: 2em;
+	font-weight: bold;
+}
