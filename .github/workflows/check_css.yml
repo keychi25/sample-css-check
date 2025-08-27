@@ -5,18 +5,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract changed selectors
+      - name: Check CSS impact and comment
         run: |
           git fetch origin main
-          git diff origin/main...HEAD -- '*.css' \
-            | grep -oE '(\.[a-zA-Z0-9_-]+|#[a-zA-Z0-9_-]+)' \
-            | sort -u > selectors.txt
 
-      - name: Search usage
-        run: |
-          while read sel; do
-            token="${sel#.}" # remove prefix . or #
-            if ! rg -q "$token" src/; then
-              echo "⚠️ Possibly unused selector: $sel"
+          # CSSファイルの変更から正確にセレクターを抽出（CSSルールの文脈を考慮）
+          selectors=$(git diff origin/main...HEAD -- '*.css' |
+            awk '
+              /^\+/ && /{/ {  # 追加された行でCSSルールの開始
+                # セレクター部分のみを抽出（{の前まで）
+                selector = substr($0, 2)  # +を除去
+                gsub(/\s*\{.*$/, "", selector)  # {以降を除去
+                gsub(/^\s+|\s+$/, "", selector)  # 前後の空白を除去
+
+                # クラス名とID名を正確に抽出
+                while (match(selector, /(\.[a-zA-Z][a-zA-Z0-9_-]*|#[a-zA-Z][a-zA-Z0-9_-]*)/)) {
+                  print substr(selector, RSTART, RLENGTH)
+                  selector = substr(selector, RSTART + RLENGTH)
+                }
+              }
+            ' | sort -u)
+
+          if [ -z "$selectors" ]; then
+            echo "No CSS selectors found in changes"
+            exit 0
+          fi
+
+          # 変更されたセレクターが他のファイルで使用されているかをチェック
+          impacted_files=""
+          while IFS= read -r selector; do
+            # セレクターの種類を判定
+            if [[ "$selector" =~ ^\. ]]; then
+              # クラス名の場合：完全一致またはクラスリスト内での存在を確認
+              class_name="${selector#.}"
+              # より精密な検索：クラス名の境界を考慮
+              files=$(rg -l --word-regexp "$class_name" src/ 2>/dev/null || true)
+            elif [[ "$selector" =~ ^# ]]; then
+              # ID名の場合：完全一致を確認
+              id_name="${selector#}"
+              # ID属性での使用を確認
+              files=$(rg -l "id=[\"']$id_name[\"']" src/ 2>/dev/null || true)
             fi
-          done < selectors.txt
+
+            if [ -n "$files" ]; then
+              impacted_files="$impacted_files\n- \`$selector\` → $(echo "$files" | tr '\n' ' ')"
+            fi
+          done <<< "$selectors"
+
+          # 影響を受けるファイルがある場合はコメント
+          if [ -n "$impacted_files" ]; then
+            comment="⚠️ **CSS Impact Check Warning**
+
+以下のCSSセレクターが変更されており、以下のファイルに影響を与える可能性があります：$impacted_files
+
+これらのファイルの動作に影響がないか確認してください。"
+
+            echo "$comment" | gh pr comment --body-file -
+          else
+            echo "No files are impacted by CSS changes"
+          fi
