@@ -16,5 +16,17 @@ p {
 .h1-main {
 	font-size: 2em;
 	font-weight: bold;
-	height: 1.2em;
+	height: 1.5em;
+}
+
+.h1-sub {
+  font-size: 1.5em;
+  font-weight: bold;
+  height: 1.2em;
+}
+
+.p-main {
+  font-size: 1em;
+  font-weight: normal;
+  height: 1.5em;
 }
