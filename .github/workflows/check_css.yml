@@ -1,56 +1,108 @@
+name: CSS Impact Check
+
 on: [pull_request]
+
+permissions:
+  pull-requests: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   css-impact-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check CSS impact and comment
+      - name: 1. Check CSS file changes
+        id: check-css
         run: |
-          cat << 'EOF' > check_css.sh
-          #!/bin/bash
+          echo "🔍 Checking CSS file changes..."
+          css_changes=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} | grep '\.css$')
 
-          git fetch origin main
-
-          # CSSファイルの変更からセレクターを抽出
-          selectors=$(git diff origin/main...HEAD -- '*.css' | grep -oE '(\.[a-zA-Z][a-zA-Z0-9_-]*|#[a-zA-Z][a-zA-Z0-9_-]*)' | sort -u)
-
-          if [ -z "$selectors" ]; then
-            echo "No CSS selectors found in changes"
+          if [ -z "$css_changes" ]; then
+            echo "No CSS files changed"
+            echo "css_changed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 変更されたセレクターが他のファイルで使用されているかをチェック
+          echo "Changed CSS files: $css_changes"
+          echo "css_changed=true" >> $GITHUB_OUTPUT
+          echo "css_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$css_changes" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: 2. Extract CSS selectors
+        id: extract-selectors
+        if: steps.check-css.outputs.css_changed == 'true'
+        run: |
+          echo "📝 Extracting CSS selectors from changes..."
+          selectors=$(git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} -- '*.css' |
+                     grep -oE '(\.[a-zA-Z][a-zA-Z0-9_-]*|#[a-zA-Z][a-zA-Z0-9_-]*)' |
+                     grep -v '^\.css$' | sort -u)
+
+          if [ -z "$selectors" ]; then
+            echo "No CSS selectors found in changes"
+            echo "selectors_found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found selectors: $selectors"
+          echo "selectors_found=true" >> $GITHUB_OUTPUT
+          echo "selectors<<EOF" >> $GITHUB_OUTPUT
+          echo "$selectors" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: 3. Check usage in src/ directory
+        id: check-usage
+        if: steps.extract-selectors.outputs.selectors_found == 'true'
+        run: |
+          echo "🔎 Checking usage in src/ directory..."
+          selectors="${{ steps.extract-selectors.outputs.selectors }}"
           impacted_files=""
+
           while IFS= read -r selector; do
             if [[ "$selector" =~ ^\. ]]; then
-              # クラス名の場合
               class_name="${selector#.}"
-              files=$(rg -l --word-regexp "$class_name" src/ 2>/dev/null || true)
+              files=$(grep -l "class=[\"'].*$class_name.*[\"']" src/*.html 2>/dev/null || true)
             elif [[ "$selector" =~ ^# ]]; then
-              # ID名の場合
               id_name="${selector#}"
-              files=$(rg -l "id=[\"']$id_name[\"']" src/ 2>/dev/null || true)
+              files=$(grep -l "id=[\"']$id_name[\"']" src/*.html 2>/dev/null || true)
             fi
 
             if [ -n "$files" ]; then
-              impacted_files="$impacted_files\n- \`$selector\` → $(echo "$files" | tr '\n' ' ')"
+              impacted_files="$impacted_files
+            - \`$selector\` → $(echo "$files" | tr '\n' ' ')"
             fi
           done <<< "$selectors"
 
-          # 影響を受けるファイルがある場合はコメント
           if [ -n "$impacted_files" ]; then
-            cat << 'COMMENT_EOF' | gh pr comment --body-file -
-          ⚠️ **CSS Impact Check Warning**
-
-          以下のCSSセレクターが変更されており、以下のファイルに影響を与える可能性があります：$impacted_files
-
-          これらのファイルの動作に影響がないか確認してください。
-          COMMENT_EOF
+            echo "Files impacted: $impacted_files"
+            echo "has_impact=true" >> $GITHUB_OUTPUT
+            echo "impacted_files<<EOF" >> $GITHUB_OUTPUT
+            echo "$impacted_files" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
           else
             echo "No files are impacted by CSS changes"
+            echo "has_impact=false" >> $GITHUB_OUTPUT
           fi
+
+
+      - name: 4. Comment on PR
+        if: steps.check-usage.outputs.has_impact == 'true'
+        run: |
+          cat > comment.md <<'EOF'
+          ⚠️ **CSS Impact Check Warning**
+
+          以下のCSSセレクターが変更されており、以下のファイルに影響を与える可能性があります：
+
+          ${{ steps.check-usage.outputs.impacted_files }}
+
+          これらのファイルの動作に影響がないか確認してください。
           EOF
 
-          chmod +x check_css.sh
-          ./check_css.sh
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
